@@ -174,7 +174,7 @@ class PickWordsService : AccessibilityService() {
 
         val scroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
-            fillViewport = true
+            isFillViewport = true
             addView(row)
         }
         val params = WindowManager.LayoutParams(
