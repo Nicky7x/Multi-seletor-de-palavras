@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">PickWords</string>
+    <string name="service_description">Mostra um botão flutuante que permite selecionar palavras não consecutivas na tela e copiá-las para a área de transferência. O texto lido nunca sai do aparelho.</string>
+</resources>
