@@ -1,263 +1,292 @@
 package com.example.pickwords
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Point
 import android.graphics.Rect
-import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
-import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Button
-import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
+/**
+ * Acessório não invasivo do teclado.
+ * Lê somente o campo editável em foco, ao pressionar "+ Palavra".
+ * O Android não suporta múltiplas seleções nativas em outro aplicativo.
+ */
 class PickWordsService : AccessibilityService() {
 
-    private class Word(val text: String, val rect: Rect) {
-        var selected = false
-        var view: View? = null
-    }
+    private data class Fragment(val start: Int, val end: Int, val text: String)
 
     private lateinit var wm: WindowManager
-    private var fab: View? = null
-    private var overlay: FrameLayout? = null
-    private var copyBtn: Button? = null
-    private var words = listOf<Word>()
+    private val handler = Handler(Looper.getMainLooper())
+    private var bar: View? = null
+    private var barParams: WindowManager.LayoutParams? = null
+    private var countView: TextView? = null
+    private val picked = mutableListOf<Fragment>()
+    private var selectedFieldText: String? = null
+    private var selectedFieldWindowId: Int? = null
+    private var selectedFieldPackage: String? = null
+    private val tokenRegex = Regex("""[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*""")
+    private val refresh = Runnable { syncWithKeyboard() }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun dp(x: Int) = (x * resources.displayMetrics.density + .5f).toInt()
 
     override fun onServiceConnected() {
+        super.onServiceConnected()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        showFab()
+        serviceInfo = serviceInfo.apply {
+            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        }
+        scheduleRefresh()
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+            val node = event.source
+            if (node?.isEditable == true && !node.isPassword && selectedFieldText != null) {
+                if (node.windowId == selectedFieldWindowId &&
+                    node.packageName?.toString() == selectedFieldPackage &&
+                    node.text?.toString() != selectedFieldText
+                ) clearPicked()
+            }
+        }
+        scheduleRefresh()
+    }
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
-        closeOverlay()
-        fab?.let { runCatching { wm.removeView(it) } }
-        fab = null
+        handler.removeCallbacks(refresh)
+        removeBar()
+        clearPicked()
         super.onDestroy()
     }
 
-    // Botão flutuante (arrastável na vertical)
-    private fun showFab() {
-        val lp = WindowManager.LayoutParams(
-            dp(44), dp(44),
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.END or Gravity.CENTER_VERTICAL; x = dp(2) }
-
-        var downY = 0f
-        var startY = 0
-        var moved = false
-        val btn = TextView(this).apply {
-            text = "✎"; textSize = 20f; gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#CC3F51B5"))
-            }
-            setOnTouchListener { v, e ->
-                when (e.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> { downY = e.rawY; startY = lp.y; moved = false; true }
-                    MotionEvent.ACTION_MOVE -> {
-                        val dy = (e.rawY - downY).toInt()
-                        if (abs(dy) > dp(6)) moved = true
-                        if (moved) { lp.y = startY + dy; wm.updateViewLayout(v, lp) }
-                        true
-                    }
-                    MotionEvent.ACTION_UP -> { if (!moved) startPicking(); true }
-                    else -> false
-                }
-            }
-        }
-        wm.addView(btn, lp)
-        fab = btn
-    }
-
-    // Leitura da tela
-    private fun startPicking() {
-        if (overlay != null) return
-        val root = rootInActiveWindow
-        if (root == null) { toast("Não consegui ler esta tela"); return }
-        val found = mutableListOf<Word>()
-        collect(root, found)
-        if (found.isEmpty()) { toast("Nenhum texto selecionável encontrado"); return }
-        words = found
-        fab?.visibility = View.GONE
-        showOverlay()
-    }
-
-    private fun collect(n: AccessibilityNodeInfo?, out: MutableList<Word>) {
-        if (n == null || !n.isVisibleToUser || n.isPassword) return
-        val text = n.text?.toString()
-            ?: if (n.childCount == 0) n.contentDescription?.toString() else null
-        if (!text.isNullOrBlank()) addWords(n, text, out)
-        for (i in 0 until n.childCount) collect(n.getChild(i), out)
-    }
-
-    private fun addWords(n: AccessibilityNodeInfo, text: String, out: MutableList<Word>) {
-        val b = Rect(); n.getBoundsInScreen(b)
-        if (b.isEmpty) return
-        val chars = charRects(n, text)
-        Regex("\\S+").findAll(text).forEach { m ->
-            val s = m.range.first
-            val e = m.range.last + 1
-            var r: Rect? = null
-            if (chars != null) {
-                val u = RectF(); var any = false
-                for (i in s until e) {
-                    val c = chars.getOrNull(i) ?: continue
-                    if (any) u.union(c) else { u.set(c); any = true }
-                }
-                if (any) r = Rect(u.left.toInt(), u.top.toInt(), u.right.toInt(), u.bottom.toInt())
-            }
-            if (r == null) {
-                val w = b.width().toFloat()
-                r = Rect(b.left + (w * s / text.length).toInt(), b.top,
-                         b.left + (w * e / text.length).toInt(), b.bottom)
-            }
-            if (!r.isEmpty) out += Word(m.value, r)
-        }
+    private fun scheduleRefresh() {
+        handler.removeCallbacks(refresh)
+        handler.postDelayed(refresh, 160)
     }
 
     @Suppress("DEPRECATION")
-    private fun charRects(n: AccessibilityNodeInfo, text: String): List<RectF?>? {
-        val key = AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_KEY
-        val args = Bundle().apply {
-            putInt(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_START_INDEX, 0)
-            putInt(AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_LENGTH,
-                minOf(text.length, AccessibilityNodeInfo.EXTRA_DATA_TEXT_CHARACTER_LOCATION_ARG_MAX_LENGTH))
+    private fun deviceHeight(): Int {
+        val p = Point()
+        wm.defaultDisplay.getRealSize(p)
+        return p.y
+    }
+
+    private fun getEditor(): AccessibilityNodeInfo? {
+        val focused = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused?.isEditable == true && focused.isFocused && !focused.isPassword) return focused
+        for (w in windows) {
+            if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val node = w.root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            if (node?.isEditable == true && node.isFocused && !node.isPassword) return node
         }
-        return try {
-            if (n.refreshWithExtraData(key, args)) n.extras.getParcelableArray(key)?.map { it as? RectF }
-            else null
-        } catch (e: Exception) { null }
+        return null
     }
 
-    // Overlay de seleção
-    private fun boxBg(selected: Boolean) = GradientDrawable().apply {
-        cornerRadius = dp(4).toFloat()
-        if (selected) { setColor(Color.parseColor("#88FFC107")); setStroke(dp(1), Color.parseColor("#FFFF9800")) }
-        else setStroke(dp(1), Color.parseColor("#664F6BED"))
+    private fun syncWithKeyboard() {
+        if (!::wm.isInitialized) return
+        val screen = deviceHeight()
+        val ime = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        val keyboardRect = Rect()
+        ime?.getBoundsInScreen(keyboardRect)
+
+        // Sem teclado ou campo de edição não mostramos nada.
+        val visible = ime != null && !keyboardRect.isEmpty &&
+            keyboardRect.top > screen / 3 &&
+            keyboardRect.top < screen - dp(80) &&
+            getEditor() != null
+
+        if (!visible) {
+            removeBar()
+            return
+        }
+        val offset = (screen - keyboardRect.top + dp(3)).coerceAtLeast(dp(80))
+        if (bar == null) createBar(offset)
+        else {
+            val params = barParams ?: return
+            if (params.y != offset) {
+                params.y = offset
+                bar?.let { runCatching { wm.updateViewLayout(it, params) } }
+            }
+        }
     }
 
-    private fun showOverlay() {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.parseColor("#33000000")) }
-        val lp = WindowManager.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+    private fun bg(): GradientDrawable = GradientDrawable().apply {
+        cornerRadius = dp(14).toFloat()
+        setColor(Color.rgb(38, 40, 44))
+    }
+
+    private fun createBar(offset: Int) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), 0, dp(6), 0)
+            background = bg()
+            elevation = dp(5).toFloat()
+        }
+        val counter = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(dp(8), 0, dp(8), 0)
+            maxLines = 1
+            text = "✓ 0"
+        }
+        countView = counter
+        row.addView(counter)
+
+        fun button(label: String, click: () -> Unit) = Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 13f
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(8), 0, dp(8), 0)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)
+            )
+            setOnClickListener { click() }
+        }
+
+        row.addView(button("+ Palavra") { addAtCursor() })
+        row.addView(button("Copiar") { copyPicked() })
+        row.addView(button("Limpar") { clearPicked() })
+
+        val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            fillViewport = true
+            addView(row)
+        }
+        val params = WindowManager.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            gravity = Gravity.BOTTOM
+            y = offset
         }
-
-        root.post {
-            val loc = IntArray(2); root.getLocationOnScreen(loc)
-            words.forEach { w ->
-                val v = View(this).apply { background = boxBg(false) }
-                root.addView(v, 0, FrameLayout.LayoutParams(w.rect.width(), w.rect.height()).apply {
-                    leftMargin = w.rect.left - loc[0]; topMargin = w.rect.top - loc[1]
-                })
-                w.view = v
-            }
+        try {
+            wm.addView(scroll, params)
+            bar = scroll
+            barParams = params
+            refreshCounter()
+        } catch (_: Exception) {
+            countView = null
         }
-
-        var paint = true
-        root.setOnTouchListener { _, e ->
-            val x = e.rawX.toInt(); val y = e.rawY.toInt()
-            val hit = words.lastOrNull {
-                Rect(it.rect).apply { inset(-dp(3), -dp(2)) }.contains(x, y)
-            }
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { if (hit != null) { paint = !hit.selected; setSel(hit, paint) } }
-                MotionEvent.ACTION_MOVE -> { if (hit != null) setSel(hit, paint) }
-            }
-            true
-        }
-
-        fun barBtn(label: String, action: () -> Unit) = Button(this).apply {
-            text = label; isAllCaps = false; setOnClickListener { action() }
-        }
-        val copy = barBtn("Copiar (0)") { copySelected() }
-        copyBtn = copy
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            isClickable = true
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-            background = GradientDrawable().apply {
-                cornerRadius = dp(28).toFloat(); setColor(Color.parseColor("#EE263238"))
-            }
-            addView(barBtn("Cancelar") { closeOverlay() })
-            addView(barBtn("Limpar") { words.forEach { setSel(it, false) } })
-            addView(copy)
-        }
-        root.addView(bar, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        ).apply { bottomMargin = dp(72) })
-
-        wm.addView(root, lp)
-        overlay = root
     }
 
-    private fun setSel(w: Word, sel: Boolean) {
-        if (w.selected == sel) return
-        w.selected = sel
-        w.view?.background = boxBg(sel)
-        copyBtn?.text = "Copiar (" + words.count { it.selected } + ")"
+    private fun removeBar() {
+        bar?.let { runCatching { wm.removeView(it) } }
+        bar = null
+        countView = null
+        barParams = null
     }
 
-    private fun closeOverlay() {
-        overlay?.let { runCatching { wm.removeView(it) } }
-        overlay = null; copyBtn = null; words = emptyList()
-        fab?.visibility = View.VISIBLE
+    private fun refreshCounter() {
+        countView?.text = "✓ " + picked.size
     }
 
-    // Copiar
-    private fun readingOrder(l: List<Word>): List<Word> {
-        val out = mutableListOf<Word>()
-        var line = mutableListOf<Word>()
-        var anchor = 0
-        for (w in l.sortedBy { it.rect.centerY() }) {
-            if (line.isNotEmpty() && w.rect.centerY() - anchor > w.rect.height() / 2) {
-                out += line.sortedBy { it.rect.left }; line = mutableListOf()
-            }
-            if (line.isEmpty()) anchor = w.rect.centerY()
-            line += w
+    private fun clearPicked() {
+        picked.clear()
+        selectedFieldText = null
+        selectedFieldWindowId = null
+        selectedFieldPackage = null
+        refreshCounter()
+    }
+
+    private fun addAtCursor() {
+        val editor = getEditor()
+        if (editor == null) {
+            toast("Toque primeiro no campo de escrita")
+            return
         }
-        out += line.sortedBy { it.rect.left }
-        return out
+        val content = editor.text?.toString().orEmpty()
+        if (content.isEmpty()) {
+            toast("O campo está vazio")
+            return
+        }
+        val start = editor.textSelectionStart
+        val end = editor.textSelectionEnd
+        if (start < 0 || end < 0 || start > content.length || end > content.length) {
+            toast("Este aplicativo não informa a posição do cursor")
+            return
+        }
+
+        val from: Int
+        val to: Int
+        if (start != end) {
+            from = min(start, end)
+            to = max(start, end)
+        } else {
+            // A alça não precisa ser arrastada: basta pôr o cursor na palavra.
+            val caret = start
+            val matches = tokenRegex.findAll(content).toList()
+            val token = matches.firstOrNull {
+                caret > it.range.first && caret <= it.range.last + 1
+            } ?: matches.firstOrNull { caret == it.range.first }
+            if (token == null) {
+                toast("Posicione o cursor sobre uma palavra")
+                return
+            }
+            from = token.range.first
+            to = token.range.last + 1
+        }
+
+        val pkg = editor.packageName?.toString()
+        if (selectedFieldText != content ||
+            selectedFieldWindowId != editor.windowId ||
+            selectedFieldPackage != pkg
+        ) clearPicked()
+
+        selectedFieldText = content
+        selectedFieldWindowId = editor.windowId
+        selectedFieldPackage = pkg
+
+        if (picked.any { it.start == from && it.end == to }) {
+            toast("Essa palavra já foi adicionada")
+            return
+        }
+        picked += Fragment(from, to, content.substring(from, to))
+        refreshCounter()
+        toast("Adicionada: " + content.substring(from, to).take(36))
     }
 
-    private fun copySelected() {
-        val sel = readingOrder(words.filter { it.selected })
-        if (sel.isEmpty()) { toast("Nenhuma palavra selecionada"); return }
-        val punct = charArrayOf('.', ',', ';', ':', '!', '?', '"', '\'', '(', ')', '[', ']', '“', '”')
-        val text = sel.joinToString(" ") { w -> w.text.trim(*punct).ifEmpty { w.text } }
+    private fun copyPicked() {
+        if (picked.isEmpty()) {
+            toast("Adicione uma palavra antes")
+            return
+        }
+        val text = picked.sortedBy { it.start }.joinToString(" ") { it.text }
         (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
             .setPrimaryClip(ClipData.newPlainText("PickWords", text))
-        toast(sel.size.toString() + " palavra(s) copiada(s)")
-        closeOverlay()
+        toast(picked.size.toString() + " seleção(ões) copiadas")
+        clearPicked()
     }
 
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
 }

@@ -19,13 +19,20 @@ class MainActivity : Activity() {
         }
         col.addView(TextView(this).apply {
             textSize = 16f
-            text = "PickWords\n\n" +
-                "1) Toque em \"Permitir configurações restritas\" e, no menu ⋮, " +
-                "ative \"Permitir configurações restritas\" (necessário em apps instalados fora da Play Store).\n\n" +
-                "2) Toque em \"Abrir acessibilidade\", escolha PickWords e ative.\n\n" +
-                "3) Um botão ✎ aparecerá na lateral. Toque nele em qualquer tela, " +
-                "toque ou deslize o dedo sobre as palavras desejadas e aperte Copiar.\n\n" +
-                "Dica Xiaomi/HyperOS: em Bateria do app, escolha \"Sem restrições\" e ative \"Início automático\"."
+            text = "PickWords 2.0 — acessório do teclado\n\n" +
+                "O teclado Xiaomi/Gboard continua sendo seu teclado normal. " +
+                "Quando ele aparece em um campo editável, o PickWords " +
+                "tenta mostrar uma barra compacta logo acima dele.\n\n" +
+                "1. Abra uma conversa, nota ou outro campo de escrita.\n" +
+                "2. Toque na palavra desejada para posicionar o cursor.\n" +
+                "3. Pressione '+ Palavra' na barra acima do teclado.\n" +
+                "4. Repita com outras palavras (sem arrastar alças).\n" +
+                "5. Pressione 'Copiar' para copiar só as selecionadas.\n\n" +
+                "Não há OCR, captura de tela nem contornos desenhados.\n\n" +
+                "Limitação do Android: não é possível manter vários destaques " +
+                "nativos independentes em um campo de outro aplicativo. " +
+                "O PickWords acumula as seleções em sua própria lista.\n\n" +
+                "O serviço lê apenas o campo de escrita quando você usa '+ Palavra'."
         })
         col.addView(Button(this).apply {
             text = "Permitir configurações restritas"
