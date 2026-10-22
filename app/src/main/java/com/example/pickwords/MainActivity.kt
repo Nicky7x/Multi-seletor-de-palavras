@@ -7,44 +7,53 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         val pad = (20 * resources.displayMetrics.density).toInt()
-        val col = LinearLayout(this).apply {
+        val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad * 2, pad, pad)
         }
-        col.addView(TextView(this).apply {
-            textSize = 16f
-            text = "PickWords 2.0 — acessório do teclado\n\n" +
-                "O teclado Xiaomi/Gboard continua sendo seu teclado normal. " +
-                "Quando ele aparece em um campo editável, o PickWords " +
-                "tenta mostrar uma barra compacta logo acima dele.\n\n" +
-                "1. Abra uma conversa, nota ou outro campo de escrita.\n" +
-                "2. Toque na palavra desejada para posicionar o cursor.\n" +
-                "3. Pressione '+ Palavra' na barra acima do teclado.\n" +
-                "4. Repita com outras palavras (sem arrastar alças).\n" +
-                "5. Pressione 'Copiar' para copiar só as selecionadas.\n\n" +
-                "Não há OCR, captura de tela nem contornos desenhados.\n\n" +
-                "Limitação do Android: não é possível manter vários destaques " +
-                "nativos independentes em um campo de outro aplicativo. " +
-                "O PickWords acumula as seleções em sua própria lista.\n\n" +
-                "O serviço lê apenas o campo de escrita quando você usa '+ Palavra'."
+        panel.addView(TextView(this).apply {
+            textSize = 17f
+            text = "PickWords 3.0 — seleção nativa do Android\n\n" +
+                "Agora NÃO é necessário abrir o teclado.\n\n" +
+                "1. Em uma nota, mensagem ou página, mantenha o dedo pressionado " +
+                "sobre uma palavra até aparecerem as alças de seleção.\n" +
+                "2. Se esse aplicativo disponibilizar a seleção ao Android, " +
+                "a barra PickWords aparece automaticamente.\n" +
+                "3. Toque em '+ Seleção' para guardar esse trecho.\n" +
+                "4. Selecione outra palavra distante, toque '+ Seleção' novamente.\n" +
+                "5. Toque 'Copiar': somente os trechos guardados são copiados.\n\n" +
+                "Nenhuma borda é desenhada e o texto não é lido de imagens.\n\n" +
+                "IMPORTANTE: o Android não expõe diretamente a visibilidade " +
+                "das alças; o serviço depende de eventos de seleção. " +
+                "Alguns apps, sites e navegadores não fornecem esses eventos " +
+                "ou o conteúdo selecionado. Nesse caso não é possível " +
+                "detectar a seleção automaticamente por Acessibilidade.\n\n" +
+                "O texto selecionado é processado localmente e não é enviado " +
+                "a nenhum servidor. Evite selecionar informações sensíveis."
         })
-        col.addView(Button(this).apply {
+        panel.addView(Button(this).apply {
             text = "Permitir configurações restritas"
             setOnClickListener {
-                startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.parse("package:$packageName")))
+                startActivity(Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:$packageName")
+                ))
             }
         })
-        col.addView(Button(this).apply {
+        panel.addView(Button(this).apply {
             text = "Abrir acessibilidade"
-            setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            }
         })
-        setContentView(col)
+        setContentView(ScrollView(this).apply { addView(panel) })
     }
 }

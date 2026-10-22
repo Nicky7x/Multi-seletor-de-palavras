@@ -1,16 +1,15 @@
 package com.example.pickwords
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.Point
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -23,162 +22,188 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import kotlin.math.max
-import kotlin.math.min
 
 /**
- * Acessório não invasivo do teclado.
- * Lê somente o campo editável em foco, ao pressionar "+ Palavra".
- * O Android não suporta múltiplas seleções nativas em outro aplicativo.
+ * PickWords v3: detecta seleções NATIVAS de texto (alças do Android).
+ * Não depende da abertura do teclado e não desenha caixas sobre palavras.
+ *
+ * Acessibilidade não fornece evento dedicado para "alças ficaram visíveis":
+ * TYPE_VIEW_TEXT_SELECTION_CHANGED com intervalo não vazio é o sinal mais
+ * próximo. Alguns navegadores/apps não emitem esse evento ou não expõem
+ * o conteúdo selecionado.
  */
 class PickWordsService : AccessibilityService() {
-
-    private data class Fragment(val start: Int, val end: Int, val text: String)
+    private data class CapturedSelection(
+        val packageName: String,
+        val windowId: Int,
+        val start: Int,
+        val end: Int,
+        val content: String
+    ) {
+        val selected: String get() = content.substring(start, end)
+    }
 
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
-    private var bar: View? = null
-    private var barParams: WindowManager.LayoutParams? = null
-    private var countView: TextView? = null
-    private val picked = mutableListOf<Fragment>()
-    private var selectedFieldText: String? = null
-    private var selectedFieldWindowId: Int? = null
-    private var selectedFieldPackage: String? = null
-    private val tokenRegex = Regex("""[\p{L}\p{N}_]+(?:['’\-][\p{L}\p{N}_]+)*""")
-    private val refresh = Runnable { syncWithKeyboard() }
+    private var toolbar: View? = null
+    private var toolbarParams: WindowManager.LayoutParams? = null
+    private var countLabel: TextView? = null
+    private var previewLabel: TextView? = null
 
-    private fun dp(x: Int) = (x * resources.displayMetrics.density + .5f).toInt()
+    private var activeSelection: CapturedSelection? = null
+    private var lastSelectionAt: Long = 0L
+    private val collected = mutableListOf<CapturedSelection>()
+    private var appPackage: String? = null
+
+    private val dismissal = Runnable {
+        if (collected.isEmpty() && SystemClock.uptimeMillis() - lastSelectionAt > 12000L) {
+            activeSelection = null
+            removeToolbar()
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        serviceInfo = serviceInfo.apply {
-            flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-        }
-        scheduleRefresh()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
-            val node = event.source
-            if (node?.isEditable == true && !node.isPassword && selectedFieldText != null) {
-                if (node.windowId == selectedFieldWindowId &&
-                    node.packageName?.toString() == selectedFieldPackage &&
-                    node.text?.toString() != selectedFieldText
-                ) clearPicked()
+        if (event == null || !::wm.isInitialized) return
+
+        // Um intervalo não vazio indica seleção; cursor sozinho tem start == end.
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED) {
+            val candidate = readSelection(event)
+            if (candidate != null) {
+                // Nunca misturar trechos de aplicativos diferentes.
+                if (appPackage != null && appPackage != candidate.packageName) resetAll()
+                appPackage = candidate.packageName
+                activeSelection = candidate
+                lastSelectionAt = SystemClock.uptimeMillis()
+                showToolbar()
+                updateToolbar()
+                handler.removeCallbacks(dismissal)
+                handler.postDelayed(dismissal, 12500L)
+            }
+            // Não apagamos a última seleção ao receber o evento de cursor:
+            // alguns apps colapsam a seleção ao tocar em controles externos.
+            return
+        }
+
+        // Se o app em primeiro plano mudou, não mantemos o conteúdo anterior.
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val pkg = event.packageName?.toString()
+            if (pkg != null && pkg != packageName && appPackage != null && pkg != appPackage) {
+                // Ignora uma mudança de janela de teclado ou sistema dentro do mesmo app.
+                val sameAppVisible = windows.any {
+                    it.type == AccessibilityWindowInfo.TYPE_APPLICATION &&
+                    it.isActive &&
+                    it.root?.packageName?.toString() == appPackage
+                }
+                if (!sameAppVisible) resetAll()
             }
         }
-        scheduleRefresh()
     }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
-        handler.removeCallbacks(refresh)
-        removeBar()
-        clearPicked()
+        handler.removeCallbacks(dismissal)
+        resetAll()
         super.onDestroy()
     }
 
-    private fun scheduleRefresh() {
-        handler.removeCallbacks(refresh)
-        handler.postDelayed(refresh, 160)
-    }
+    private fun readSelection(event: AccessibilityEvent): CapturedSelection? {
+        if (event.isPassword) return null
+        val node = event.source
+        if (node?.isPassword == true) return null
+        val pkg = event.packageName?.toString() ?: node?.packageName?.toString() ?: return null
+        if (pkg == packageName) return null
 
-    @Suppress("DEPRECATION")
-    private fun deviceHeight(): Int {
-        val p = Point()
-        wm.defaultDisplay.getRealSize(p)
-        return p.y
-    }
+        val nodeText = node?.text?.toString()
+        val eventText = event.text.firstOrNull()?.toString()
+        val text = if (!nodeText.isNullOrEmpty()) nodeText else eventText ?: return null
 
-    private fun getEditor(): AccessibilityNodeInfo? {
-        val focused = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-        if (focused?.isEditable == true && focused.isFocused && !focused.isPassword) return focused
-        for (w in windows) {
-            if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
-            val node = w.root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            if (node?.isEditable == true && node.isFocused && !node.isPassword) return node
+        // A maioria dos TextView/EditText fornece índices no evento.
+        // Em outros, os índices só estão em AccessibilityNodeInfo.
+        val eStart = event.fromIndex
+        val eEnd = event.toIndex
+        val nStart = node?.textSelectionStart ?: -1
+        val nEnd = node?.textSelectionEnd ?: -1
+        val eventValid = eStart >= 0 && eEnd > eStart && eEnd <= text.length
+        val nodeValid = nStart >= 0 && nEnd > nStart && nEnd <= text.length
+
+        val start = when {
+            eventValid -> eStart
+            nodeValid -> nStart
+            else -> return null
         }
-        return null
+        val end = if (eventValid) eEnd else nEnd
+        val selection = text.substring(start, end)
+
+        if (selection.isBlank() || selection.length > 5000) return null
+        return CapturedSelection(pkg, node?.windowId ?: event.windowId, start, end, text)
     }
 
-    private fun syncWithKeyboard() {
-        if (!::wm.isInitialized) return
-        val screen = deviceHeight()
+    private fun dp(value: Int) = (value * resources.displayMetrics.density + .5f).toInt()
+
+    private fun panelBg() = GradientDrawable().apply {
+        setColor(Color.rgb(39, 41, 47))
+        cornerRadius = dp(16).toFloat()
+    }
+
+    // Não há gatilho pela abertura do teclado. Ele só muda o posicionamento.
+    private fun bottomOffset(): Int {
         val ime = windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
-        val keyboardRect = Rect()
-        ime?.getBoundsInScreen(keyboardRect)
-
-        // Sem teclado ou campo de edição não mostramos nada.
-        val visible = ime != null && !keyboardRect.isEmpty &&
-            keyboardRect.top > screen / 3 &&
-            keyboardRect.top < screen - dp(80) &&
-            getEditor() != null
-
-        if (!visible) {
-            removeBar()
-            return
-        }
-        val offset = (screen - keyboardRect.top + dp(3)).coerceAtLeast(dp(80))
-        if (bar == null) createBar(offset)
-        else {
-            val params = barParams ?: return
-            if (params.y != offset) {
-                params.y = offset
-                bar?.let { runCatching { wm.updateViewLayout(it, params) } }
-            }
-        }
+        val bounds = Rect()
+        ime?.getBoundsInScreen(bounds)
+        if (bounds.isEmpty) return dp(74)
+        val height = resources.displayMetrics.heightPixels
+        val size = height - bounds.top
+        return if (size in dp(130)..(height * 0.7f).toInt()) size + dp(8) else dp(74)
     }
 
-    private fun bg(): GradientDrawable = GradientDrawable().apply {
-        cornerRadius = dp(14).toFloat()
-        setColor(Color.rgb(38, 40, 44))
-    }
-
-    private fun createBar(offset: Int) {
-        val row = LinearLayout(this).apply {
+    private fun showToolbar() {
+        if (toolbar != null) return
+        val line = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), 0, dp(6), 0)
-            background = bg()
-            elevation = dp(5).toFloat()
+            setPadding(dp(7), 0, dp(7), 0)
+            background = panelBg()
+            elevation = dp(7).toFloat()
         }
-        val counter = TextView(this).apply {
+        val count = TextView(this).apply {
+            text = "0"
+            textSize = 14f
             setTextColor(Color.WHITE)
-            textSize = 13f
             setPadding(dp(8), 0, dp(8), 0)
-            maxLines = 1
-            text = "✓ 0"
         }
-        countView = counter
-        row.addView(counter)
+        countLabel = count
+        line.addView(count)
 
-        fun button(label: String, click: () -> Unit) = Button(this).apply {
-            text = label
+        fun pill(text: String, callback: () -> Unit) = Button(this).apply {
+            this.text = text
             isAllCaps = false
             textSize = 13f
             minHeight = 0
             minimumHeight = 0
-            setPadding(dp(8), 0, dp(8), 0)
+            setPadding(dp(7), 0, dp(7), 0)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)
             )
-            setOnClickListener { click() }
+            setOnClickListener { callback() }
         }
+        line.addView(pill("+ Seleção") { addSelection() })
+        line.addView(pill("Copiar") { copySelections() })
+        line.addView(pill("Limpar") { resetAll() })
 
-        row.addView(button("+ Palavra") { addAtCursor() })
-        row.addView(button("Copiar") { copyPicked() })
-        row.addView(button("Limpar") { clearPicked() })
-
-        val scroll = HorizontalScrollView(this).apply {
+        val outer = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
             isFillViewport = true
-            addView(row)
+            addView(line)
         }
         val params = WindowManager.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, dp(52),
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            dp(52),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
@@ -186,104 +211,77 @@ class PickWordsService : AccessibilityService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM
-            y = offset
+            y = bottomOffset()
         }
         try {
-            wm.addView(scroll, params)
-            bar = scroll
-            barParams = params
-            refreshCounter()
+            wm.addView(outer, params)
+            toolbar = outer
+            toolbarParams = params
         } catch (_: Exception) {
-            countView = null
+            countLabel = null
         }
     }
 
-    private fun removeBar() {
-        bar?.let { runCatching { wm.removeView(it) } }
-        bar = null
-        countView = null
-        barParams = null
-    }
-
-    private fun refreshCounter() {
-        countView?.text = "✓ " + picked.size
-    }
-
-    private fun clearPicked() {
-        picked.clear()
-        selectedFieldText = null
-        selectedFieldWindowId = null
-        selectedFieldPackage = null
-        refreshCounter()
-    }
-
-    private fun addAtCursor() {
-        val editor = getEditor()
-        if (editor == null) {
-            toast("Toque primeiro no campo de escrita")
-            return
-        }
-        val content = editor.text?.toString().orEmpty()
-        if (content.isEmpty()) {
-            toast("O campo está vazio")
-            return
-        }
-        val start = editor.textSelectionStart
-        val end = editor.textSelectionEnd
-        if (start < 0 || end < 0 || start > content.length || end > content.length) {
-            toast("Este aplicativo não informa a posição do cursor")
-            return
-        }
-
-        val from: Int
-        val to: Int
-        if (start != end) {
-            from = min(start, end)
-            to = max(start, end)
-        } else {
-            // A alça não precisa ser arrastada: basta pôr o cursor na palavra.
-            val caret = start
-            val matches = tokenRegex.findAll(content).toList()
-            val token = matches.firstOrNull {
-                caret > it.range.first && caret <= it.range.last + 1
-            } ?: matches.firstOrNull { caret == it.range.first }
-            if (token == null) {
-                toast("Posicione o cursor sobre uma palavra")
-                return
+    private fun updateToolbar() {
+        countLabel?.text = collected.size.toString() + " ✓"
+        toolbarParams?.let { params ->
+            val updatedOffset = bottomOffset()
+            if (params.y != updatedOffset) {
+                params.y = updatedOffset
+                toolbar?.let { runCatching { wm.updateViewLayout(it, params) } }
             }
-            from = token.range.first
-            to = token.range.last + 1
         }
-
-        val pkg = editor.packageName?.toString()
-        if (selectedFieldText != content ||
-            selectedFieldWindowId != editor.windowId ||
-            selectedFieldPackage != pkg
-        ) clearPicked()
-
-        selectedFieldText = content
-        selectedFieldWindowId = editor.windowId
-        selectedFieldPackage = pkg
-
-        if (picked.any { it.start == from && it.end == to }) {
-            toast("Essa palavra já foi adicionada")
-            return
-        }
-        picked += Fragment(from, to, content.substring(from, to))
-        refreshCounter()
-        toast("Adicionada: " + content.substring(from, to).take(36))
     }
 
-    private fun copyPicked() {
-        if (picked.isEmpty()) {
-            toast("Adicione uma palavra antes")
+    private fun removeToolbar() {
+        toolbar?.let { runCatching { wm.removeView(it) } }
+        toolbar = null
+        toolbarParams = null
+        countLabel = null
+        previewLabel = null
+    }
+
+    private fun addSelection() {
+        val current = activeSelection
+        if (current == null) {
+            toast("Selecione um trecho usando as alças do Android")
             return
         }
-        val text = picked.sortedBy { it.start }.joinToString(" ") { it.text }
+        if (collected.any {
+                it.packageName == current.packageName &&
+                it.windowId == current.windowId &&
+                it.start == current.start &&
+                it.end == current.end &&
+                it.content == current.content
+            }) {
+            toast("Esse trecho já foi adicionado")
+            return
+        }
+        collected.add(current)
+        lastSelectionAt = SystemClock.uptimeMillis()
+        handler.removeCallbacks(dismissal)
+        updateToolbar()
+        toast("Adicionado: " + current.selected.take(40))
+    }
+
+    private fun copySelections() {
+        if (collected.isEmpty()) {
+            toast("Pressione + Seleção primeiro")
+            return
+        }
+        val content = collected.joinToString(" ") { it.selected }
         (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
-            .setPrimaryClip(ClipData.newPlainText("PickWords", text))
-        toast(picked.size.toString() + " seleção(ões) copiadas")
-        clearPicked()
+            .setPrimaryClip(ClipData.newPlainText("PickWords", content))
+        toast(collected.size.toString() + " trecho(s) copiado(s)")
+        resetAll()
+    }
+
+    private fun resetAll() {
+        activeSelection = null
+        appPackage = null
+        collected.clear()
+        handler.removeCallbacks(dismissal)
+        removeToolbar()
     }
 
     private fun toast(message: String) {

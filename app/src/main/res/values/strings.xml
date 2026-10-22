@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">PickWords</string>
-    <string name="service_description">Detecta quando o teclado aparece e permite escolher palavras do campo de escrita em foco. Não utiliza OCR ou captura de tela.</string>
+    <string name="service_description">Exibe controles quando o Android informa que houve seleção de texto. Permite acumular e copiar trechos não consecutivos sem OCR ou destaques artificiais.</string>
 </resources>
